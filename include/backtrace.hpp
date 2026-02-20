@@ -32,6 +32,7 @@ private:
         dl_phdr_info phdr_info{};
         bool in_use = false;
         ElfPhdr* phdr_copy = nullptr;
+        char* name_copy = nullptr;      // strdup'd 独立副本，避免悬空指针
         void* eh_frame_registered = nullptr;
     };
     

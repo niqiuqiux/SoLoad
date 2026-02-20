@@ -324,7 +324,7 @@ bool ElfImage::parseDynamic() {
     
     // 计算 bias 并找到动态段
     for (int i = 0; i < header_->e_phnum; i++) {
-        if (phdr[i].p_type == PT_LOAD && phdr[i].p_offset == 0) {
+        if (phdr[i].p_type == PT_LOAD && phdr[i].p_offset == 0 && bias_ == 0) {
             bias_ = phdr[i].p_vaddr;
         }
         if (phdr[i].p_type == PT_DYNAMIC) {

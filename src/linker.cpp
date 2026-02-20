@@ -47,6 +47,9 @@ namespace soloader {
 #ifndef R_AARCH64_TLSDESC
 #define R_AARCH64_TLSDESC       1031
 #endif
+#ifndef R_AARCH64_COPY
+#define R_AARCH64_COPY          1024
+#endif
 
 // Android 压缩重定位
 #ifndef DT_ANDROID_RELA
@@ -56,15 +59,33 @@ namespace soloader {
 #define DT_ANDROID_RELSZ    0x60000010
 #endif
 
+// Android RELR 变体
+#ifndef DT_ANDROID_RELR
+#define DT_ANDROID_RELR     0x6fffe000
+#define DT_ANDROID_RELRSZ   0x6fffe001
+#define DT_ANDROID_RELRENT  0x6fffe003
+#endif
+
 int g_argc = 0;
 char** g_argv = nullptr;
 char** g_envp = nullptr;
 
 static size_t s_page_size = 0;
 
+// TLSDESC resolver: 返回相对于 TLS block 基地址的偏移量（而非绝对地址）
+static ElfAddr dynamic_tls_resolver(TlsIndex* ti) {
+    void* addr = TlsManager::instance().getAddress(ti);
+    void* block_base = TlsManager::instance().getAddress(nullptr);
+    return reinterpret_cast<ElfAddr>(addr) - reinterpret_cast<ElfAddr>(block_base);
+}
+
 size_t pageSize() {
     if (s_page_size == 0) {
-        s_page_size = sysconf(_SC_PAGESIZE);
+        long ps = sysconf(_SC_PAGESIZE);
+        if (ps <= 0) {
+            LOGF("Failed to get system page size");
+        }
+        s_page_size = static_cast<size_t>(ps);
     }
     return s_page_size;
 }
@@ -92,6 +113,13 @@ bool Linker::init(std::unique_ptr<ElfImage> image) {
 }
 
 void Linker::destroy() {
+    // 主库析构（主库依赖于依赖库，所以主库析构函数必须先执行）
+    if (main_image_ && is_linked_) {
+        BacktraceManager::instance().unregisterEhFrame(main_image_.get());
+        BacktraceManager::instance().unregisterLibrary(main_image_.get());
+        callDestructors(main_image_.get());
+    }
+
     // 逆序调用依赖的析构函数
     for (auto it = deps_.rbegin(); it != deps_.rend(); ++it) {
         if (it->image && it->is_manual_load) {
@@ -99,13 +127,6 @@ void Linker::destroy() {
             BacktraceManager::instance().unregisterLibrary(it->image.get());
             callDestructors(it->image.get());
         }
-    }
-    
-    // 主库析构
-    if (main_image_ && is_linked_) {
-        BacktraceManager::instance().unregisterEhFrame(main_image_.get());
-        BacktraceManager::instance().unregisterLibrary(main_image_.get());
-        callDestructors(main_image_.get());
     }
     
     // 释放依赖
@@ -538,26 +559,30 @@ void Linker::processRelocation(ElfImage* /*image*/, uint32_t sym_idx, uint32_t t
                                ElfAddr offset, ElfAddr addend, ElfAddr load_bias,
                                ElfSym* dynsym, const char* dynstr, bool is_rela) {
     auto* target = reinterpret_cast<ElfAddr*>(load_bias + offset);
-    
+
     switch (type) {
     case R_AARCH64_NONE:
         break;
-        
+
+    case R_AARCH64_COPY:
+        LOGW("R_AARCH64_COPY relocation not supported");
+        break;
+
     case R_AARCH64_RELATIVE:
         *target = load_bias + (is_rela ? addend : *target);
         break;
-        
+
     case R_AARCH64_IRELATIVE: {
         auto resolver = load_bias + (is_rela ? addend : *target);
-        
+
         struct IfuncArg { unsigned long size, hwcap, hwcap2; };
         IfuncArg arg{sizeof(IfuncArg), getauxval(AT_HWCAP), getauxval(AT_HWCAP2)};
         using Resolver = ElfAddr(*)(uint64_t, IfuncArg*);
-        
+
         *target = reinterpret_cast<Resolver>(resolver)(arg.hwcap | (1ULL << 62), &arg);
         break;
     }
-    
+
     case R_AARCH64_GLOB_DAT:
     case R_AARCH64_ABS64:
     case R_AARCH64_JUMP_SLOT:
@@ -567,12 +592,12 @@ void Linker::processRelocation(ElfImage* /*image*/, uint32_t sym_idx, uint32_t t
     case R_AARCH64_TLSDESC: {
         const char* sym_name = dynstr + dynsym[sym_idx].st_name;
         auto sym = findSymbolCached(sym_name);
-        
+
         if (!sym.valid()) {
             LOGE("Undefined symbol: %s", sym_name);
             return;
         }
-        
+
         // Hook dl_iterate_phdr 和 dladdr
         if (strcmp(sym_name, "dl_iterate_phdr") == 0) {
             *target = reinterpret_cast<ElfAddr>(&BacktraceManager::customDlIteratePhdr);
@@ -582,14 +607,14 @@ void Linker::processRelocation(ElfImage* /*image*/, uint32_t sym_idx, uint32_t t
             *target = reinterpret_cast<ElfAddr>(&BacktraceManager::customDladdr);
             return;
         }
-        
+
         switch (type) {
         case R_AARCH64_GLOB_DAT:
         case R_AARCH64_JUMP_SLOT:
             *target = reinterpret_cast<ElfAddr>(sym.address);
             break;
         case R_AARCH64_ABS64:
-            *target = reinterpret_cast<ElfAddr>(sym.address) + (is_rela ? addend : 0);
+            *target = reinterpret_cast<ElfAddr>(sym.address) + (is_rela ? addend : *target);
             break;
         case R_AARCH64_TLS_DTPMOD:
             // TLS 重定位需要有效的 image
@@ -612,7 +637,7 @@ void Linker::processRelocation(ElfImage* /*image*/, uint32_t sym_idx, uint32_t t
             TlsIndex ti{sym.image->tlsModuleId(), static_cast<unsigned long>(dynsym[sym_idx].st_value + addend)};
             auto* block = TlsManager::instance().getAddress(&ti);
             if (block) {
-                *target = reinterpret_cast<ElfAddr>(block) - 
+                *target = reinterpret_cast<ElfAddr>(block) -
                           reinterpret_cast<ElfAddr>(TlsManager::instance().getAddress(nullptr));
             } else {
                 LOGE("Failed to get TLS address for symbol: %s", sym_name);
@@ -629,16 +654,16 @@ void Linker::processRelocation(ElfImage* /*image*/, uint32_t sym_idx, uint32_t t
             }
             auto* ti = TlsManager::instance().allocateIndex(
                 sym.image, &dynsym[sym_idx], addend);
-            target[0] = reinterpret_cast<ElfAddr>(&__tls_get_addr);
+            target[0] = reinterpret_cast<ElfAddr>(&dynamic_tls_resolver);
             target[1] = reinterpret_cast<ElfAddr>(ti);
             break;
         }
         }
         break;
     }
-    
+
     default:
-        LOGF("Unsupported relocation type: %u", type);
+        LOGE("Unsupported relocation type: %u", type);
     }
 }
 
@@ -705,6 +730,18 @@ void Linker::processRelocations(ElfImage* image) {
             break;
         case DT_ANDROID_REL:
             android_reloc = reinterpret_cast<void*>(ptr);
+            break;
+        case DT_ANDROID_RELR:
+            relr = reinterpret_cast<ElfAddr*>(ptr);
+            break;
+        case DT_ANDROID_RELRSZ:
+            relr_sz = d->d_un.d_val;
+            break;
+        case DT_ANDROID_RELRENT:
+            if (d->d_un.d_val != sizeof(ElfAddr)) {
+                LOGE("Unsupported DT_ANDROID_RELRENT size %zu", static_cast<size_t>(d->d_un.d_val));
+                return;
+            }
             break;
         }
     }
@@ -791,6 +828,8 @@ void Linker::processRelocations(ElfImage* image) {
             
             if (is_android_rela && (group_flags & HAS_ADDEND) && (group_flags & GROUPED_BY_ADDEND))
                 addend += dec.decode();
+            else if (!is_android_rela && (group_flags & HAS_ADDEND))
+                LOGE("REL relocations should not have addends");
             
             for (uint64_t j = 0; j < group_size; j++) {
                 if (group_flags & GROUPED_BY_OFFSET_DELTA)
@@ -836,25 +875,68 @@ void Linker::restoreProtections(ElfImage* image) {
     auto* header = image->header();
     auto* phdr = reinterpret_cast<ElfPhdr*>(
         reinterpret_cast<uintptr_t>(header) + header->e_phoff);
-    
+
+    // 找到所有可加载段的最小和最大地址
+    uintptr_t min_addr = UINTPTR_MAX;
+    uintptr_t max_addr = 0;
     for (int i = 0; i < header->e_phnum; i++) {
         if (phdr[i].p_type != PT_LOAD) continue;
-        
+
+        uintptr_t seg_start = reinterpret_cast<uintptr_t>(image->base()) +
+                              phdr[i].p_vaddr - image->bias();
+        uintptr_t seg_end = seg_start + phdr[i].p_memsz;
+
+        if (seg_start < min_addr) min_addr = seg_start;
+        if (seg_end > max_addr) max_addr = seg_end;
+    }
+
+    if (min_addr >= max_addr) return;
+
+    uintptr_t start_page = pageStart(min_addr);
+    uintptr_t end_page = pageEnd(max_addr);
+    size_t pg_size = pageSize();
+    size_t num_pages = (end_page - start_page) / pg_size;
+
+    if (num_pages == 0) return;
+
+    // 分配逐页保护位图
+    auto page_prots = std::make_unique<int[]>(num_pages);
+    memset(page_prots.get(), 0, num_pages * sizeof(int));
+
+    // 对每个段，将其保护位 OR 到覆盖的所有页上
+    for (int i = 0; i < header->e_phnum; i++) {
+        if (phdr[i].p_type != PT_LOAD) continue;
+
         int prot = 0;
         if (phdr[i].p_flags & PF_R) prot |= PROT_READ;
         if (phdr[i].p_flags & PF_W) prot |= PROT_WRITE;
         if (phdr[i].p_flags & PF_X) prot |= PROT_EXEC;
-        
-        auto start = pageStart(reinterpret_cast<uintptr_t>(image->base()) + 
-                              phdr[i].p_vaddr - image->bias());
-        auto end = pageEnd(reinterpret_cast<uintptr_t>(image->base()) + 
-                          phdr[i].p_vaddr + phdr[i].p_memsz - image->bias());
-        
-        mprotect(reinterpret_cast<void*>(start), end - start, prot);
-        
+
+        uintptr_t seg_start = reinterpret_cast<uintptr_t>(image->base()) +
+                              phdr[i].p_vaddr - image->bias();
+        uintptr_t seg_end = seg_start + phdr[i].p_memsz;
+        uintptr_t cur_page = pageStart(seg_start);
+
+        while (cur_page < pageEnd(seg_end)) {
+            size_t idx = (cur_page - start_page) / pg_size;
+            if (idx < num_pages) {
+                page_prots[idx] |= prot;
+            }
+            cur_page += pg_size;
+        }
+    }
+
+    // 逐页恢复保护
+    for (size_t i = 0; i < num_pages; i++) {
+        int prot = page_prots[i];
+        if (prot == 0) continue;
+
+        uintptr_t page_addr = start_page + i * pg_size;
+        mprotect(reinterpret_cast<void*>(page_addr), pg_size, prot);
+
         if (prot & PROT_EXEC) {
-            __builtin___clear_cache(reinterpret_cast<char*>(start), 
-                                   reinterpret_cast<char*>(end));
+            __builtin___clear_cache(reinterpret_cast<char*>(page_addr),
+                                   reinterpret_cast<char*>(page_addr + pg_size));
         }
     }
 }

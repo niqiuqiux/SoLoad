@@ -193,7 +193,8 @@ bool BacktraceManager::registerLibrary(ElfImage* image) {
     memcpy(lib.phdr_copy, orig_phdr, phdr_size);
     
     lib.phdr_info.dlpi_addr = reinterpret_cast<ElfW(Addr)>(image->base()) - image->bias();
-    lib.phdr_info.dlpi_name = image->path().c_str();
+    lib.name_copy = strdup(image->path().c_str());
+    lib.phdr_info.dlpi_name = lib.name_copy;
     lib.phdr_info.dlpi_phdr = reinterpret_cast<const ElfW(Phdr)*>(lib.phdr_copy);
     lib.phdr_info.dlpi_phnum = header->e_phnum;
     lib.phdr_info.dlpi_adds = 1;
@@ -219,10 +220,11 @@ bool BacktraceManager::unregisterLibrary(ElfImage* image) {
             if (libs_[i].eh_frame_registered && __deregister_frame) {
                 __deregister_frame(libs_[i].eh_frame_registered);
             }
-            
+
             free(libs_[i].phdr_copy);
+            free(libs_[i].name_copy);
             libs_[i] = {};
-            
+
             LOGD("Unregistered library: %s", image->path().c_str());
             return true;
         }
