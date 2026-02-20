@@ -128,7 +128,23 @@ void Linker::destroy() {
             callDestructors(it->image.get());
         }
     }
-    
+
+    // 释放 TLSDESC 分配的 TlsIndex
+    for (auto* ti : tls_indices_) {
+        delete ti;
+    }
+    tls_indices_.clear();
+
+    // 注销 TLS 段
+    for (auto it = deps_.rbegin(); it != deps_.rend(); ++it) {
+        if (it->image) {
+            TlsManager::instance().unregisterSegment(it->image.get());
+        }
+    }
+    if (main_image_) {
+        TlsManager::instance().unregisterSegment(main_image_.get());
+    }
+
     // 释放依赖
     for (auto& dep : deps_) {
         if (dep.is_manual_load && dep.map_size > 0) {
@@ -136,13 +152,13 @@ void Linker::destroy() {
         }
     }
     deps_.clear();
-    
+
     // 释放主库
     if (main_map_size_ > 0 && main_image_) {
         munmap(main_image_->base(), main_map_size_);
     }
     main_image_.reset();
-    
+
     is_linked_ = false;
     main_map_size_ = 0;
 }
@@ -155,12 +171,28 @@ void Linker::abandon() {
             BacktraceManager::instance().unregisterLibrary(dep.image.get());
         }
     }
-    
+
     if (main_image_ && is_linked_) {
         BacktraceManager::instance().unregisterEhFrame(main_image_.get());
         BacktraceManager::instance().unregisterLibrary(main_image_.get());
     }
-    
+
+    // 释放 TLSDESC 分配的 TlsIndex
+    for (auto* ti : tls_indices_) {
+        delete ti;
+    }
+    tls_indices_.clear();
+
+    // 注销 TLS 段
+    for (auto it = deps_.rbegin(); it != deps_.rend(); ++it) {
+        if (it->image) {
+            TlsManager::instance().unregisterSegment(it->image.get());
+        }
+    }
+    if (main_image_) {
+        TlsManager::instance().unregisterSegment(main_image_.get());
+    }
+
     deps_.clear();
     main_image_.reset();
     is_linked_ = false;
@@ -460,35 +492,54 @@ SymbolLookup Linker::findSymbol(std::string_view name) {
 bool Linker::loadDependencies() {
     std::set<std::string> loaded_names;
     std::vector<std::string> to_load;
-    
+
+    // 辅助函数：从动态段获取字符串表和 DT_NEEDED 列表
+    auto collectNeeded = [](ElfImage* img, ElfDyn* dyn,
+                            std::set<std::string>& names,
+                            std::vector<std::string>& out) {
+        if (!dyn) return;
+
+        // 优先使用 DT_STRTAB（运行时地址），回退到节区头 strtab
+        const char* strtab = nullptr;
+        for (auto* d = dyn; d->d_tag != DT_NULL; d++) {
+            if (d->d_tag == DT_STRTAB) {
+                strtab = reinterpret_cast<const char*>(
+                    reinterpret_cast<uintptr_t>(img->base()) + d->d_un.d_ptr - img->bias());
+                break;
+            }
+        }
+        if (!strtab) strtab = img->strtabStart();
+        if (!strtab) return;
+
+        for (auto* d = dyn; d->d_tag != DT_NULL; d++) {
+            if (d->d_tag == DT_NEEDED) {
+                std::string name = strtab + d->d_un.d_val;
+                if (names.insert(name).second) {
+                    out.push_back(name);
+                }
+            }
+        }
+    };
+
     // 收集主库的依赖
     auto* header = main_image_->header();
     if (!header->e_phoff) return true;
-    
+
     auto* phdr = reinterpret_cast<ElfPhdr*>(
         reinterpret_cast<uintptr_t>(header) + header->e_phoff);
-    
+
     ElfDyn* dyn = nullptr;
     for (int i = 0; i < header->e_phnum; i++) {
         if (phdr[i].p_type == PT_DYNAMIC) {
             dyn = reinterpret_cast<ElfDyn*>(
-                reinterpret_cast<uintptr_t>(main_image_->base()) + 
+                reinterpret_cast<uintptr_t>(main_image_->base()) +
                 phdr[i].p_vaddr - main_image_->bias());
             break;
         }
     }
-    
-    if (dyn && main_image_->strtabStart()) {
-        for (auto* d = dyn; d->d_tag != DT_NULL; d++) {
-            if (d->d_tag == DT_NEEDED) {
-                std::string name = main_image_->strtabStart() + d->d_un.d_val;
-                if (loaded_names.insert(name).second) {
-                    to_load.push_back(name);
-                }
-            }
-        }
-    }
-    
+
+    collectNeeded(main_image_.get(), dyn, loaded_names, to_load);
+
     // 递归加载依赖
     for (size_t i = 0; i < to_load.size(); i++) {
         std::string full_path;
@@ -496,11 +547,11 @@ bool Linker::loadDependencies() {
             LOGW("Skipping missing library: %s", to_load[i].c_str());
             continue;
         }
-        
+
         if (isLoaded(full_path)) continue;
-        
+
         LoadedDep dep;
-        
+
         // 尝试使用系统已加载的库
         auto check = ElfImage::create(full_path, nullptr);
         if (check && check->base()) {
@@ -520,13 +571,13 @@ bool Linker::loadDependencies() {
             }
             dep.is_manual_load = true;
         }
-        
+
         // 收集该依赖的依赖
         if (dep.is_manual_load && dep.image->header()->e_phoff) {
             auto* dep_header = dep.image->header();
             auto* dep_phdr = reinterpret_cast<ElfPhdr*>(
                 reinterpret_cast<uintptr_t>(dep_header) + dep_header->e_phoff);
-            
+
             ElfDyn* dep_dyn = nullptr;
             for (int j = 0; j < dep_header->e_phnum; j++) {
                 if (dep_phdr[j].p_type == PT_DYNAMIC) {
@@ -536,22 +587,13 @@ bool Linker::loadDependencies() {
                     break;
                 }
             }
-            
-            if (dep_dyn && dep.image->strtabStart()) {
-                for (auto* d = dep_dyn; d->d_tag != DT_NULL; d++) {
-                    if (d->d_tag == DT_NEEDED) {
-                        std::string name = dep.image->strtabStart() + d->d_un.d_val;
-                        if (loaded_names.insert(name).second) {
-                            to_load.push_back(name);
-                        }
-                    }
-                }
-            }
+
+            collectNeeded(dep.image.get(), dep_dyn, loaded_names, to_load);
         }
-        
+
         deps_.push_back(std::move(dep));
     }
-    
+
     return true;
 }
 
@@ -656,6 +698,7 @@ void Linker::processRelocation(ElfImage* /*image*/, uint32_t sym_idx, uint32_t t
                 sym.image, &dynsym[sym_idx], addend);
             target[0] = reinterpret_cast<ElfAddr>(&dynamic_tls_resolver);
             target[1] = reinterpret_cast<ElfAddr>(ti);
+            tls_indices_.push_back(ti);
             break;
         }
         }

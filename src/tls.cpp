@@ -1,6 +1,7 @@
 // Modern C++17 SO Loader - TLS Implementation (arm64 only)
 
 #include "tls.hpp"
+#include "linker.hpp"
 #include "log.hpp"
 #include <pthread.h>
 #include <cstring>
@@ -89,6 +90,9 @@ void TlsManager::unregisterSegment(ElfImage* image) {
 
 void* TlsManager::allocateBlock() {
     size_t align = static_align_max_ ? static_align_max_ : sizeof(void*);
+    // 限制对齐值不超过页大小（与原始实现一致）
+    size_t pg_size = pageSize();
+    if (align > pg_size) align = pg_size;
     size_t total = static_size_ + align;
     
     if (total == 0) {

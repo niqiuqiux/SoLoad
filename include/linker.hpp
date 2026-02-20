@@ -10,6 +10,8 @@
 
 namespace soloader {
 
+struct TlsIndex;
+
 struct LoadedDep {
     std::unique_ptr<ElfImage> image;
     bool is_manual_load = false;
@@ -90,6 +92,9 @@ private:
     // 符号缓存
     mutable std::mutex cache_mutex_;
     std::unordered_map<std::string, SymbolCacheEntry> symbol_cache_;
+
+    // TLSDESC 分配的 TlsIndex 指针（需要在 destroy 时释放）
+    std::vector<TlsIndex*> tls_indices_;
 };
 
 // 全局参数

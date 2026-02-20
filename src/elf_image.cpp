@@ -316,17 +316,31 @@ bool ElfImage::parseHeaders() {
 
 bool ElfImage::parseDynamic() {
     if (!header_->e_phoff || !header_->e_phnum) return true;
-    
+
     auto* phdr = reinterpret_cast<ElfPhdr*>(
         reinterpret_cast<uintptr_t>(header_) + header_->e_phoff);
-    
-    ElfDyn* dyn = nullptr;
-    
-    // 计算 bias 并找到动态段
+
+    // 第一遍：先计算 bias（确保后续使用 bias 的计算正确）
     for (int i = 0; i < header_->e_phnum; i++) {
         if (phdr[i].p_type == PT_LOAD && phdr[i].p_offset == 0 && bias_ == 0) {
             bias_ = phdr[i].p_vaddr;
+            break;
         }
+    }
+
+    // 如果没找到 offset==0 的 PT_LOAD，用第一个 PT_LOAD
+    if (bias_ == 0) {
+        for (int i = 0; i < header_->e_phnum; i++) {
+            if (phdr[i].p_type == PT_LOAD) {
+                bias_ = phdr[i].p_vaddr - phdr[i].p_offset;
+                break;
+            }
+        }
+    }
+
+    // 第二遍：使用正确的 bias 处理其他段
+    ElfDyn* dyn = nullptr;
+    for (int i = 0; i < header_->e_phnum; i++) {
         if (phdr[i].p_type == PT_DYNAMIC) {
             dyn = reinterpret_cast<ElfDyn*>(
                 reinterpret_cast<uintptr_t>(base_) + phdr[i].p_vaddr - bias_);
@@ -338,16 +352,6 @@ bool ElfImage::parseDynamic() {
             eh_frame_hdr_ = reinterpret_cast<const uint8_t*>(
                 reinterpret_cast<uintptr_t>(base_) + phdr[i].p_vaddr - bias_);
             eh_frame_hdr_size_ = phdr[i].p_memsz;
-        }
-    }
-    
-    // 如果没找到 bias，用第一个 PT_LOAD
-    if (bias_ == 0) {
-        for (int i = 0; i < header_->e_phnum; i++) {
-            if (phdr[i].p_type == PT_LOAD) {
-                bias_ = phdr[i].p_vaddr - phdr[i].p_offset;
-                break;
-            }
         }
     }
     
