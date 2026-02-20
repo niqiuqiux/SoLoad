@@ -99,7 +99,7 @@ uintptr_t pageEnd(uintptr_t addr) {
 }
 
 Linker::~Linker() {
-    if (is_linked_) {
+    if (main_image_ || !deps_.empty()) {
         destroy();
     }
 }
@@ -640,22 +640,30 @@ void Linker::processRelocation(ElfImage* /*image*/, uint32_t sym_idx, uint32_t t
             return;
         }
 
-        // Hook dl_iterate_phdr 和 dladdr
-        if (strcmp(sym_name, "dl_iterate_phdr") == 0) {
-            *target = reinterpret_cast<ElfAddr>(&BacktraceManager::customDlIteratePhdr);
-            return;
-        }
-        if (strcmp(sym_name, "dladdr") == 0) {
-            *target = reinterpret_cast<ElfAddr>(&BacktraceManager::customDladdr);
-            return;
-        }
-
         switch (type) {
         case R_AARCH64_GLOB_DAT:
         case R_AARCH64_JUMP_SLOT:
+            // Hook dl_iterate_phdr 和 dladdr（仅对非 TLS 类型）
+            if (strcmp(sym_name, "dl_iterate_phdr") == 0) {
+                *target = reinterpret_cast<ElfAddr>(&BacktraceManager::customDlIteratePhdr);
+                return;
+            }
+            if (strcmp(sym_name, "dladdr") == 0) {
+                *target = reinterpret_cast<ElfAddr>(&BacktraceManager::customDladdr);
+                return;
+            }
             *target = reinterpret_cast<ElfAddr>(sym.address);
             break;
         case R_AARCH64_ABS64:
+            // Hook dl_iterate_phdr 和 dladdr（仅对非 TLS 类型）
+            if (strcmp(sym_name, "dl_iterate_phdr") == 0) {
+                *target = reinterpret_cast<ElfAddr>(&BacktraceManager::customDlIteratePhdr);
+                return;
+            }
+            if (strcmp(sym_name, "dladdr") == 0) {
+                *target = reinterpret_cast<ElfAddr>(&BacktraceManager::customDladdr);
+                return;
+            }
             *target = reinterpret_cast<ElfAddr>(sym.address) + (is_rela ? addend : *target);
             break;
         case R_AARCH64_TLS_DTPMOD:
@@ -989,11 +997,17 @@ void Linker::callConstructors(ElfImage* image) {
         LOGD("Calling .init for %s", image->path().c_str());
         image->initFunc()();
     }
-    
+
     if (image->initArray()) {
         LOGD("Calling .init_array for %s", image->path().c_str());
         for (size_t i = 0; i < image->initArrayCount(); i++) {
-            image->initArray()[i](g_argc, g_argv, g_envp);
+            auto fn = image->initArray()[i];
+            // 跳过哨兵值（与 bionic linker 一致）
+            if (reinterpret_cast<uintptr_t>(fn) == 0 ||
+                reinterpret_cast<uintptr_t>(fn) == static_cast<uintptr_t>(-1)) {
+                continue;
+            }
+            fn(g_argc, g_argv, g_envp);
         }
     }
 }
@@ -1001,10 +1015,16 @@ void Linker::callConstructors(ElfImage* image) {
 void Linker::callDestructors(ElfImage* image) {
     if (image->finiArray()) {
         for (size_t i = image->finiArrayCount(); i > 0; i--) {
-            image->finiArray()[i - 1]();
+            auto fn = image->finiArray()[i - 1];
+            // 跳过哨兵值（与 bionic linker 一致）
+            if (reinterpret_cast<uintptr_t>(fn) == 0 ||
+                reinterpret_cast<uintptr_t>(fn) == static_cast<uintptr_t>(-1)) {
+                continue;
+            }
+            fn();
         }
     }
-    
+
     if (image->finiFunc()) {
         image->finiFunc()();
     }

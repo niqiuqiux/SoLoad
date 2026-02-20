@@ -74,7 +74,6 @@ private:
                           ElfSym* dynsym, const char* dynstr, bool is_rela);
     
     SymbolLookup findSymbol(std::string_view name);
-    SymbolLookup findSymbolWithBind(std::string_view name, uint8_t* out_bind = nullptr);
     bool findLibraryPath(std::string_view name, std::string& out);
     bool isLoaded(std::string_view path);
     void restoreProtections(ElfImage* image);

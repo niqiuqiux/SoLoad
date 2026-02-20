@@ -71,7 +71,7 @@ bool SoLoader::load(std::string_view lib_path) {
     // 执行链接
     if (!linker_.link()) {
         LOGE("Failed to link library: %s", path_str.c_str());
-        // linker_.destroy() 会处理清理
+        linker_.destroy();
         return false;
     }
     
