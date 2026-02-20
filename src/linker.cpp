@@ -122,7 +122,7 @@ void Linker::destroy() {
 
     // 逆序调用依赖的析构函数
     for (auto it = deps_.rbegin(); it != deps_.rend(); ++it) {
-        if (it->image && it->is_manual_load) {
+        if (it->image && it->is_manual_load && is_linked_) {
             BacktraceManager::instance().unregisterEhFrame(it->image.get());
             BacktraceManager::instance().unregisterLibrary(it->image.get());
             callDestructors(it->image.get());
@@ -851,37 +851,47 @@ void Linker::processRelocations(ElfImage* image) {
         }
         
         Sleb128Decoder dec(static_cast<const uint8_t*>(android_reloc) + 4, android_reloc_sz - 4);
-        
+
         uint64_t num_relocs = dec.decodeUnsigned();
         ElfAddr r_offset = dec.decode();
-        
+        ElfAddr addend = 0;  // addend 是 delta-encoded，必须跨 group 持续累加
+
         for (uint64_t i = 0; i < num_relocs; ) {
             uint64_t group_size = dec.decodeUnsigned();
             uint64_t group_flags = dec.decodeUnsigned();
-            
+
             constexpr uint64_t GROUPED_BY_INFO = 1;
             constexpr uint64_t GROUPED_BY_OFFSET_DELTA = 2;
             constexpr uint64_t GROUPED_BY_ADDEND = 4;
             constexpr uint64_t HAS_ADDEND = 8;
-            
+
             ElfAddr group_offset_delta = 0;
             uint32_t sym_idx = 0, type = 0;
-            ElfAddr addend = 0;
-            
+
             if (group_flags & GROUPED_BY_OFFSET_DELTA)
                 group_offset_delta = dec.decode();
-            
+
             if (group_flags & GROUPED_BY_INFO) {
                 uint64_t r_info = dec.decodeUnsigned();
                 sym_idx = ELF_R_SYM(r_info);
                 type = ELF_R_TYPE(r_info);
             }
-            
-            if (is_android_rela && (group_flags & HAS_ADDEND) && (group_flags & GROUPED_BY_ADDEND))
-                addend += dec.decode();
-            else if (!is_android_rela && (group_flags & HAS_ADDEND))
+
+            if (is_android_rela) {
+                uint64_t addend_flags = group_flags & (HAS_ADDEND | GROUPED_BY_ADDEND);
+                if (addend_flags == (HAS_ADDEND | GROUPED_BY_ADDEND)) {
+                    // 组级别共享 addend delta
+                    addend += dec.decode();
+                } else if (addend_flags == HAS_ADDEND) {
+                    // 每个重定位有独立 addend delta（在内层循环解码）
+                } else {
+                    // 无 addend 标志，重置为 0
+                    addend = 0;
+                }
+            } else if (group_flags & HAS_ADDEND) {
                 LOGE("REL relocations should not have addends");
-            
+            }
+
             for (uint64_t j = 0; j < group_size; j++) {
                 if (group_flags & GROUPED_BY_OFFSET_DELTA)
                     r_offset += group_offset_delta;
