@@ -165,16 +165,18 @@ void Linker::destroy() {
 
 void Linker::abandon() {
     // 类似 destroy 但不调用析构函数
-    for (auto& dep : deps_) {
-        if (dep.image && dep.is_manual_load) {
-            BacktraceManager::instance().unregisterEhFrame(dep.image.get());
-            BacktraceManager::instance().unregisterLibrary(dep.image.get());
+    if (is_linked_) {
+        for (auto& dep : deps_) {
+            if (dep.image && dep.is_manual_load) {
+                BacktraceManager::instance().unregisterEhFrame(dep.image.get());
+                BacktraceManager::instance().unregisterLibrary(dep.image.get());
+            }
         }
-    }
 
-    if (main_image_ && is_linked_) {
-        BacktraceManager::instance().unregisterEhFrame(main_image_.get());
-        BacktraceManager::instance().unregisterLibrary(main_image_.get());
+        if (main_image_) {
+            BacktraceManager::instance().unregisterEhFrame(main_image_.get());
+            BacktraceManager::instance().unregisterLibrary(main_image_.get());
+        }
     }
 
     // 释放 TLSDESC 分配的 TlsIndex
@@ -427,50 +429,44 @@ SymbolLookup Linker::findSymbolCached(std::string_view name) {
 }
 
 SymbolLookup Linker::findSymbol(std::string_view name) {
-    SymbolLookup result;
-    SymbolLookup weak_result;  // 保存弱符号结果
-    
+    SymbolLookup weak_result;  // 保存第一个弱符号结果
+
     // 先在主库查找
     if (main_image_) {
         uint8_t sym_bind = 0;
         if (auto addr = main_image_->findSymbolAddress(name, &sym_bind)) {
-            result = {reinterpret_cast<void*>(*addr), main_image_.get(), sym_bind, 0};
-            
+            SymbolLookup found = {reinterpret_cast<void*>(*addr), main_image_.get(), sym_bind, 0};
+
             // 如果是强符号（GLOBAL），直接返回
-            if (sym_bind == STB_GLOBAL) {
-                return result;
+            if (sym_bind != STB_WEAK) {
+                return found;
             }
-            // 如果是弱符号，保存但继续查找
-            if (sym_bind == STB_WEAK && !weak_result.valid()) {
-                weak_result = result;
+            // 如果是弱符号，保存但继续查找更强的符号
+            if (!weak_result.valid()) {
+                weak_result = found;
             }
         }
     }
-    
+
     // 在依赖中查找
     for (auto& dep : deps_) {
         if (!dep.image) continue;
-        
+
         uint8_t sym_bind = 0;
         if (auto addr = dep.image->findSymbolAddress(name, &sym_bind)) {
-            result = {reinterpret_cast<void*>(*addr), dep.image.get(), sym_bind, 0};
-            
+            SymbolLookup found = {reinterpret_cast<void*>(*addr), dep.image.get(), sym_bind, 0};
+
             // 如果是强符号，直接返回
-            if (sym_bind == STB_GLOBAL) {
-                return result;
+            if (sym_bind != STB_WEAK) {
+                return found;
             }
-            // 如果是弱符号，保存但继续查找
-            if (sym_bind == STB_WEAK && !weak_result.valid()) {
-                weak_result = result;
+            // 如果是弱符号，保存但继续查找更强的符号
+            if (!weak_result.valid()) {
+                weak_result = found;
             }
         }
     }
-    
-    // 如果找到了强符号结果，返回它
-    if (result.valid() && !result.isWeak()) {
-        return result;
-    }
-    
+
     // 如果有弱符号结果，返回它
     if (weak_result.valid()) {
         LOGD("Using weak symbol for '%.*s'", static_cast<int>(name.size()), name.data());
@@ -632,6 +628,10 @@ void Linker::processRelocation(ElfImage* /*image*/, uint32_t sym_idx, uint32_t t
     case R_AARCH64_TLS_DTPREL:
     case R_AARCH64_TLS_TPREL:
     case R_AARCH64_TLSDESC: {
+        if (sym_idx == 0) {
+            LOGW("Symbol index 0 (STN_UNDEF) for relocation type %u", type);
+            return;
+        }
         const char* sym_name = dynstr + dynsym[sym_idx].st_name;
         auto sym = findSymbolCached(sym_name);
 
